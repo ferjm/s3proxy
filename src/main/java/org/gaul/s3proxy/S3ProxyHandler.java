@@ -292,10 +292,33 @@ public class S3ProxyHandler {
         String uri = request.getRequestURI();
         String originalUri = request.getRequestURI();
 
-        if (!this.servicePath.isEmpty()) {
-            if (uri.length() > this.servicePath.length()) {
-                uri = uri.substring(this.servicePath.length());
-            }
+        logger.debug("Original request URI: {}", originalUri);
+        logger.debug("Service path configured as: {}", this.servicePath);
+
+        // Debug different URI combinations for signature verification
+        List<String> urisToTest = new ArrayList<>();
+
+        // Original URI
+        urisToTest.add(uri);
+
+        // URI with service path removed if present
+        if (!this.servicePath.isEmpty() && uri.startsWith(this.servicePath)) {
+            urisToTest.add(uri.substring(this.servicePath.length()));
+        }
+
+        // URI with service path added if not present
+        if (!uri.startsWith(this.servicePath)) {
+            urisToTest.add(this.servicePath + uri);
+        }
+
+        // URI with double slashes removed
+        urisToTest.add(uri.replaceAll("//+", "/"));
+
+        // Adjust URI for signing
+        String signingUri = uri;
+        if (!this.servicePath.isEmpty() && uri.startsWith(this.servicePath)) {
+            signingUri = uri.substring(this.servicePath.length());
+            logger.debug("Adjusted signing URI: {}", signingUri);
         }
 
         logger.debug("request: {}", request);
@@ -307,10 +330,10 @@ public class S3ProxyHandler {
                 if (hostHeader.endsWith(virtualHostSuffix)) {
                     String bucket = hostHeader.substring(0,
                             hostHeader.length() - virtualHostSuffix.length());
-                    uri = "/" + bucket + uri;
+                    signingUri = "/" + bucket + signingUri;
                 } else {
                     String bucket = hostHeader.toLowerCase();
-                    uri = "/" + bucket + uri;
+                    signingUri = "/" + bucket + signingUri;
                 }
             }
         }
@@ -467,7 +490,7 @@ public class S3ProxyHandler {
             }
         }
 
-        String[] path = uri.split("/", 3);
+        String[] path = signingUri.split("/", 3);
         for (int i = 0; i < path.length; i++) {
             path[i] = URLDecoder.decode(path[i], StandardCharsets.UTF_8);
         }
@@ -550,15 +573,13 @@ public class S3ProxyHandler {
                         authHeader.getAuthenticationType());
             }
 
-            String expectedSignature = null;
+            logger.debug("Using URI for signature verification: {}", signingUri);
+            logger.debug("Authorization header: {}", request.getHeader(HttpHeaders.AUTHORIZATION));
 
+            String expectedSignature = null;
             if (authHeader.getHmacAlgorithm() == null) { //v2
-                // When presigned url is generated, it doesn't consider
-                // service path
-                String uriForSigning = presignedUrl ? uri : this.servicePath +
-                        uri;
                 expectedSignature = AwsSignature.createAuthorizationSignature(
-                        request, uriForSigning, credential, presignedUrl,
+                        request, signingUri, credential, presignedUrl,
                         haveBothDateHeader);
             } else {
                 String contentSha256 = request.getHeader(
@@ -575,7 +596,6 @@ public class S3ProxyHandler {
                         payload = new byte[0];
                     } else {
                         // buffer the entire stream to calculate digest
-                        // why input stream read contentlength of header?
                         payload = ByteStreams.toByteArray(ByteStreams.limit(
                                 is, v4MaxNonChunkedRequestSize + 1));
                         if (payload.length == v4MaxNonChunkedRequestSize + 1) {
@@ -583,8 +603,6 @@ public class S3ProxyHandler {
                                     S3ErrorCode.MAX_MESSAGE_LENGTH_EXCEEDED);
                         }
 
-                        // maybe we should check this when signing,
-                        // a lot of dup code with aws sign code.
                         MessageDigest md = MessageDigest.getInstance(
                             authHeader.getHashAlgorithm());
                         byte[] hash = md.digest(payload);
@@ -598,16 +616,40 @@ public class S3ProxyHandler {
                         is = new ByteArrayInputStream(payload);
                     }
 
-                    String uriForSigning = presignedUrl ? originalUri :
-                            this.servicePath + originalUri;
-                    expectedSignature = AwsSignature
-                            .createAuthorizationSignatureV4(// v4 sign
-                            baseRequest, authHeader, payload, uriForSigning,
-                            credential);
+                    // Test all URI combinations for signature verification
+                    logger.debug("Client provided signature: {}", authHeader.getSignature());
+
+                    for (String testUri : urisToTest) {
+                        try {
+                            String testSignature = AwsSignature.createAuthorizationSignatureV4(
+                                    baseRequest, authHeader, payload, testUri, credential);
+                            logger.debug("Test URI: '{}' -> Expected signature: {}",
+                                    testUri, testSignature);
+
+                            if (testSignature.equals(authHeader.getSignature())) {
+                                logger.debug("Found matching signature with URI: {}", testUri);
+                                expectedSignature = testSignature;
+                                signingUri = testUri;  // Use the matching URI for further processing
+                            }
+                        } catch (Exception e) {
+                            logger.debug("Failed to generate signature for URI '{}': {}",
+                                    testUri, e.getMessage());
+                        }
+                    }
+
+                    if (expectedSignature == null) {
+                        // If no matching signature was found, use the original URI
+                        expectedSignature = AwsSignature.createAuthorizationSignatureV4(
+                                baseRequest, authHeader, payload, signingUri, credential);
+                    }
+
                 } catch (InvalidKeyException | NoSuchAlgorithmException e) {
                     throw new S3Exception(S3ErrorCode.INVALID_ARGUMENT, e);
                 }
             }
+
+            logger.debug("Final expected signature: {}", expectedSignature);
+            logger.debug("Using URI for final verification: {}", signingUri);
 
             // AWS does not check signatures with OPTIONS verb
             if (!method.equals("OPTIONS") && !constantTimeEquals(
